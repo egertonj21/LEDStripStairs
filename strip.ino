@@ -1,27 +1,32 @@
-#include <WiFi.h>      
+#include <WiFi.h>
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <Adafruit_NeoPixel.h>
+#include <vector>
 
 #define LED_PIN    D10       // Pin where the LED strip is connected
 #define NUM_LEDS   31        // Number of LEDs in your strip
 #define HEARTBEAT_INTERVAL 60000 // Heartbeat interval in milliseconds
 
-const char* mqtt_server = "serverip";
+const char* mqtt_server = "mqtt server goes here";
 const int MQTT_PORT = 1883;
-const char* MQTT_TOPIC_SET_COLOR = "set_colour/ledstrip2";
-const char* MQTT_TOPIC_TRIGGER = "trigger/ledstrip2";
-const char* ALIVE_TOPIC = "alive/ledstrip2";
+const char* MQTT_TOPIC_TRIGGER = "trigger/ledstrip1";
+const char* ALIVE_TOPIC = "alive/ledstrip1";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 unsigned long lastHeartbeat = 0;
-unsigned long lightOffTime = 0;
-uint32_t prevColor[NUM_LEDS];
-bool isOn = false;
-uint32_t defaultColor = strip.Color(0, 0, 0);
+
+// Structure to track timing for specific LED ranges
+struct LedTimer {
+  unsigned long endTime;
+  int startLED;
+  int endLED;
+};
+
+std::vector<LedTimer> ledTimers;
 
 void setup() {
   Serial.begin(115200);
@@ -29,16 +34,12 @@ void setup() {
   strip.show(); // Initialize all pixels to 'off'
 
   WiFiManager wifiManager;
-  wifiManager.autoConnect("LEDStrip2");
+  wifiManager.autoConnect("LEDStrip1");
 
   client.setServer(mqtt_server, MQTT_PORT);
   client.setCallback(mqttCallback);
 
   reconnect();
-  // Initialize the previous color state to off
-  for (int i = 0; i < NUM_LEDS; i++) {
-    prevColor[i] = strip.Color(0, 0, 0);
-  }
 }
 
 void loop() {
@@ -52,10 +53,7 @@ void loop() {
     lastHeartbeat = millis();
   }
 
-  if (lightOffTime != 0 && millis() > lightOffTime) {
-    revertLEDs(); // Revert LEDs to previous state
-    lightOffTime = 0;
-  }
+  checkTimers();
 }
 
 void reconnect() {
@@ -63,7 +61,6 @@ void reconnect() {
     Serial.print("Attempting MQTT connection...");
     if (client.connect("LEDStripController")) {
       Serial.println("connected");
-      client.subscribe(MQTT_TOPIC_SET_COLOR);
       client.subscribe(MQTT_TOPIC_TRIGGER);
     } else {
       Serial.print("failed, rc=");
@@ -90,21 +87,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.print("]: ");
   Serial.println(message);
 
-  if (String(topic) == MQTT_TOPIC_SET_COLOR) {
-    processSetColorMessage(message);
-  } else if (String(topic) == MQTT_TOPIC_TRIGGER) {
+  if (String(topic) == MQTT_TOPIC_TRIGGER) {
     processTriggerMessage(message);
   }
-}
-
-void processSetColorMessage(String message) {
-  uint32_t colorCode = getColorFromRGBString(message);
-  for (int i = 0; i < NUM_LEDS; i++) {
-    prevColor[i] = colorCode;
-    strip.setPixelColor(i, colorCode);
-  }
-  strip.show();
-  isOn = (colorCode != strip.Color(0, 0, 0));
 }
 
 void processTriggerMessage(String message) {
@@ -120,16 +105,27 @@ void processTriggerMessage(String message) {
   uint32_t colorCode = getColorFromRGBString(color);
   int duration = durationStr.toInt();
 
-  // Save the current state of the LEDs in the specified range
-  saveLEDState(startLED, endLED + 1);
-
   // Set LEDs to the new color
   setLEDs(startLED, endLED + 1, colorCode); // endLED is inclusive
 
   if (duration > 0) {
-    lightOffTime = millis() + duration * 1000; // Convert duration to milliseconds
-  } else {
-    lightOffTime = 0; // If duration is 0 or less, light up indefinitely
+    unsigned long newEndTime = millis() + duration * 1000; // Convert duration to milliseconds
+    bool updated = false;
+
+    // Check if the timer for this range already exists and update it
+    for (auto& timer : ledTimers) {
+      if (timer.startLED == startLED && timer.endLED == endLED + 1) {
+        timer.endTime = newEndTime;
+        updated = true;
+        break;
+      }
+    }
+
+    // If no existing timer was updated, create a new one
+    if (!updated) {
+      LedTimer newTimer = { newEndTime, startLED, endLED + 1 };
+      ledTimers.push_back(newTimer);
+    }
   }
 }
 
@@ -151,15 +147,21 @@ void setLEDs(int start, int end, uint32_t color) {
   strip.show();
 }
 
-void saveLEDState(int start, int end) {
-  for (int i = start; i < end; i++) {
-    prevColor[i] = strip.getPixelColor(i);
+void checkTimers() {
+  unsigned long currentTime = millis();
+  for (auto it = ledTimers.begin(); it != ledTimers.end(); ) {
+    if (currentTime > it->endTime) {
+      turnOffLEDs(it->startLED, it->endLED);
+      it = ledTimers.erase(it); // Remove expired timer
+    } else {
+      ++it;
+    }
   }
 }
 
-void revertLEDs() {
-  for (int i = 0; i < NUM_LEDS; i++) {
-    strip.setPixelColor(i, prevColor[i]);
+void turnOffLEDs(int start, int end) {
+  for (int i = start; i < end; i++) {
+    strip.setPixelColor(i, strip.Color(0, 0, 0));
   }
   strip.show();
 }
